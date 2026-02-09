@@ -18,7 +18,7 @@ import java.util.List;
 @Plugin(
         id = "haproxydetectorvelocity",
         name = "HAProxyDetectorVelocity",
-        version = "1.0",
+        version = "1.1",
         description = "Allow mixed HAProxy and direct connections for Velocity",
         authors = {"TendoArisu"}
 )
