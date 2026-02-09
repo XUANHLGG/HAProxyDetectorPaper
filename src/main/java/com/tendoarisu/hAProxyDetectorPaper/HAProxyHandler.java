@@ -29,6 +29,15 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+        // 如果是 Geyser 的本地连接 (LocalChannel)，直接放行
+        // Geyser 插件版通过 LocalChannel 与服务端通信，不需要 HAProxy 头
+        String channelClass = ctx.channel().getClass().getSimpleName();
+        if (channelClass.contains("LocalChannel")) {
+            ctx.pipeline().remove(this);
+            super.channelRead(ctx, msg);
+            return;
+        }
+
         if (msg instanceof ByteBuf) {
             ByteBuf buf = (ByteBuf) msg;
             
@@ -39,6 +48,13 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
             buf.markReaderIndex();
             try {
+                // 再次双重检查：如果是 Geyser 流量特征，也放行
+                if (isGeyser(buf)) {
+                    ctx.pipeline().remove(this);
+                    super.channelRead(ctx, msg);
+                    return;
+                }
+
                 int res = isHAProxy(buf);
                 
                 if (res == 1) {
@@ -119,5 +135,41 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
         }
 
         return 0;
+    }
+
+    /**
+     * 判断是否为 Geyser (Bedrock) 流量
+     * Geyser 内部通信（如插件模式下的 Bedrock 连接）通常会包含特定的魔数或包结构
+     */
+    private boolean isGeyser(ByteBuf buf) {
+        int readableBytes = buf.readableBytes();
+        if (readableBytes < 1) return false;
+
+        int firstByte = buf.getByte(buf.readerIndex()) & 0xFF;
+
+        // 1. 传统的 Geyser/Bedrock 握手标识 (0xFE)
+        if (firstByte == 0xFE) {
+            return true;
+        }
+
+        // 2. Geyser 使用 MCProtocolLib 建立的 LocalSession 流量
+        // 这种流量通常是 VarInt 开头的 Minecraft 数据包
+        // 如果第一个字节是 VarInt 格式且后续符合 Minecraft 握手包特征，我们再细化判断
+        if (readableBytes >= 2) {
+            int length = firstByte; // 简化判断，通常握手包长度较小
+            int packetId = buf.getByte(buf.readerIndex() + 1) & 0xFF;
+            
+            // 如果 Packet ID 为 0x00 (Handshake)，且长度看起来像是一个 VarInt
+            // 正常 Java 直连的 Handshake 会被注入，但 Geyser 的流量可能由于是 LocalChannel 
+            // 在某些环境下表现不同。
+            // 核心逻辑：如果是标准的 Java Handshake (0x00)，我们交给注入逻辑；
+            // 如果不是标准的 Handshake，或者是 Geyser 特有的包，则放行。
+            if (firstByte > 0 && packetId != 0x00) {
+                // 非握手包头的流量，大概率是 Geyser 的内部通信包
+                return true;
+            }
+        }
+
+        return false;
     }
 }
