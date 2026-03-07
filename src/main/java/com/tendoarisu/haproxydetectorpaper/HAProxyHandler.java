@@ -1,4 +1,4 @@
-package com.tendoarisu.hAProxyDetectorPaper;
+package com.tendoarisu.haproxydetectorpaper;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -29,10 +29,18 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        // 如果是 Geyser 的本地连接 (LocalChannel)，直接放行
-        // Geyser 插件版通过 LocalChannel 与服务端通信，不需要 HAProxy 头
-        String channelClass = ctx.channel().getClass().getSimpleName();
-        if (channelClass.contains("LocalChannel")) {
+        // 1. 识别 Geyser 的本地连接 (LocalChannel) 或 EmbeddedChannel
+        // Geyser 插件版通常使用 LocalChannel
+        String className = ctx.channel().getClass().getName();
+        if (className.contains("LocalChannel") || className.contains("EmbeddedChannel")) {
+            ctx.pipeline().remove(this);
+            super.channelRead(ctx, msg);
+            return;
+        }
+
+        // 2. 识别 Geyser 的特殊地址特征 (通常是空地址或特定的本地地址)
+        SocketAddress remoteAddr = ctx.channel().remoteAddress();
+        if (remoteAddr == null || remoteAddr.toString().contains("local")) {
             ctx.pipeline().remove(this);
             super.channelRead(ctx, msg);
             return;
@@ -48,7 +56,7 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
             buf.markReaderIndex();
             try {
-                // 再次双重检查：如果是 Geyser 流量特征，也放行
+                // 3. 识别 Geyser 的包头特征 (0xFE 或非标准 Handshake)
                 if (isGeyser(buf)) {
                     ctx.pipeline().remove(this);
                     super.channelRead(ctx, msg);
@@ -63,12 +71,12 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
                 } else if (res == 0) {
                     // 直连玩家，伪造一个 HAProxy V2 头部
                     
-                    SocketAddress remoteAddr = ctx.channel().remoteAddress();
                     if (remoteAddr instanceof InetSocketAddress) {
                         InetSocketAddress inetAddr = (InetSocketAddress) remoteAddr;
                         ByteBuf fakeHeader = createV2Header(inetAddr);
                         
                         // 将伪造头和原始数据组合
+                        // 使用复合 ByteBuf 或直接组合，确保 Paper 的解码器能读到完整的签名
                         ByteBuf combined = Unpooled.wrappedBuffer(fakeHeader, buf.retain());
                         
                         // 移除自己，避免循环处理
@@ -92,18 +100,28 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
      * 创建 HAProxy V2 协议头
      */
     private ByteBuf createV2Header(InetSocketAddress addr) {
-        ByteBuf header = Unpooled.buffer(28);
+        boolean isIPv6 = addr.getAddress() instanceof java.net.Inet6Address;
+        int addressLen = isIPv6 ? 32 : 12; // IPv6: 16+16+2+2=36, IPv4: 4+4+2+2=12
+        
+        ByteBuf header = Unpooled.buffer(16 + addressLen);
         header.writeBytes(V2_SIG);
         header.writeByte(0x21); // Ver 2 | Cmd PROXY
-        header.writeByte(0x11); // AF_INET (IPv4) | STREAM (TCP)
-        header.writeShort(12);  // 剩余长度 (4+4+2+2 = 12)
         
-        // 源地址填玩家真实 IP，目标地址填 127.0.0.1 以确保通过 Paper 的安全校验
-        byte[] ip = addr.getAddress().getAddress();
-        header.writeBytes(ip);  // Source IP
-        header.writeBytes(new byte[]{127, 0, 0, 1}); // Dest IP (Localhost)
+        if (isIPv6) {
+            header.writeByte(0x21); // AF_INET6 (IPv6) | STREAM (TCP)
+            header.writeShort(36);  // 长度
+            header.writeBytes(addr.getAddress().getAddress()); // Source IPv6
+            header.writeBytes(new byte[16]); // Dest IPv6 (可以用全0或回环)
+            header.setByte(header.writerIndex() - 1, 1); // 设置回环地址 ::1
+        } else {
+            header.writeByte(0x11); // AF_INET (IPv4) | STREAM (TCP)
+            header.writeShort(12);  // 长度
+            header.writeBytes(addr.getAddress().getAddress()); // Source IPv4
+            header.writeBytes(new byte[]{127, 0, 0, 1}); // Dest IPv4
+        }
+        
         header.writeShort(addr.getPort()); // Source Port
-        header.writeShort(25565); // Dest Port
+        header.writeShort(25565); // Dest Port (默认端口)
         
         return header;
     }

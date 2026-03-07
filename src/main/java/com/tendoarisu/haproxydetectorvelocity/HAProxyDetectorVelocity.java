@@ -1,4 +1,4 @@
-package com.tendoarisu.hAProxyDetectorVelocity;
+package com.tendoarisu.haproxydetectorvelocity;
 
 import com.google.inject.Inject;
 import com.velocitypowered.api.event.Subscribe;
@@ -18,7 +18,7 @@ import java.util.List;
 @Plugin(
         id = "haproxydetectorvelocity",
         name = "HAProxyDetectorVelocity",
-        version = "1.1",
+        version = "1.2",
         description = "Allow mixed HAProxy and direct connections for Velocity",
         authors = {"TendoArisu"}
 )
