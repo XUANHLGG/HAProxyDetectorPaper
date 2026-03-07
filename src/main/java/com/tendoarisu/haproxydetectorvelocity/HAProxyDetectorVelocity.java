@@ -1,4 +1,4 @@
-package com.tendoarisu.hAProxyDetectorVelocity;
+package com.tendoarisu.haproxydetectorvelocity;
 
 import com.google.inject.Inject;
 import com.velocitypowered.api.event.Subscribe;

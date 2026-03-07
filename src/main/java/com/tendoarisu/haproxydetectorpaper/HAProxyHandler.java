@@ -1,4 +1,4 @@
-package com.tendoarisu.hAProxyDetectorPaper;
+package com.tendoarisu.haproxydetectorpaper;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -29,10 +29,18 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        // 如果是 Geyser 的本地连接 (LocalChannel)，直接放行
-        // Geyser 插件版通过 LocalChannel 与服务端通信，不需要 HAProxy 头
-        String channelClass = ctx.channel().getClass().getSimpleName();
-        if (channelClass.contains("LocalChannel")) {
+        // 1. 识别 Geyser 的本地连接 (LocalChannel) 或 EmbeddedChannel
+        // Geyser 插件版通常使用 LocalChannel
+        String className = ctx.channel().getClass().getName();
+        if (className.contains("LocalChannel") || className.contains("EmbeddedChannel")) {
+            ctx.pipeline().remove(this);
+            super.channelRead(ctx, msg);
+            return;
+        }
+
+        // 2. 识别 Geyser 的特殊地址特征 (通常是空地址或特定的本地地址)
+        SocketAddress remoteAddr = ctx.channel().remoteAddress();
+        if (remoteAddr == null || remoteAddr.toString().contains("local")) {
             ctx.pipeline().remove(this);
             super.channelRead(ctx, msg);
             return;
@@ -48,7 +56,7 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
             buf.markReaderIndex();
             try {
-                // 再次双重检查：如果是 Geyser 流量特征，也放行
+                // 3. 识别 Geyser 的包头特征 (0xFE 或非标准 Handshake)
                 if (isGeyser(buf)) {
                     ctx.pipeline().remove(this);
                     super.channelRead(ctx, msg);
@@ -63,7 +71,6 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
                 } else if (res == 0) {
                     // 直连玩家，伪造一个 HAProxy V2 头部
                     
-                    SocketAddress remoteAddr = ctx.channel().remoteAddress();
                     if (remoteAddr instanceof InetSocketAddress) {
                         InetSocketAddress inetAddr = (InetSocketAddress) remoteAddr;
                         ByteBuf fakeHeader = createV2Header(inetAddr);

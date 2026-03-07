@@ -1,4 +1,4 @@
-package com.tendoarisu.hAProxyDetectorPaper;
+package com.tendoarisu.haproxydetectorpaper;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -17,13 +17,37 @@ import java.util.logging.Level;
 
 public final class HAProxyDetectorPaper extends JavaPlugin {
 
+    private boolean proxyProtocolEnabled = false;
+
     @Override
     public void onEnable() {
         try {
+            checkProxyProtocol();
+            if (!proxyProtocolEnabled) {
+                getLogger().warning("检测到 Paper 未开启 proxy-protocol，插件将自动禁用。");
+                Bukkit.getPluginManager().disablePlugin(this);
+                return;
+            }
             injectNetty();
             getLogger().info("HAProxyDetector 已成功注入 Netty 流。");
         } catch (Exception e) {
             getLogger().log(Level.SEVERE, "注入 Netty 时出错: ", e);
+        }
+    }
+
+    private void checkProxyProtocol() {
+        try {
+            Class<?> configClass = Class.forName("io.papermc.paper.configuration.GlobalConfiguration");
+            Method getMethod = configClass.getMethod("get");
+            Object configInstance = getMethod.invoke(null);
+            
+            Field proxiedField = configInstance.getClass().getField("proxies");
+            Object proxiesObj = proxiedField.get(configInstance);
+            
+            Field proxyProtocolField = proxiesObj.getClass().getField("proxyProtocol");
+            proxyProtocolEnabled = proxyProtocolField.getBoolean(proxiesObj);
+        } catch (Exception e) {
+            proxyProtocolEnabled = true; 
         }
     }
 
