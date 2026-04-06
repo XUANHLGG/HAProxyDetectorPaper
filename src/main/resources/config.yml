@@ -1,0 +1,13 @@
+# HAProxyDetector 配置
+# --------------------
+
+# 是否开启白名单检查
+# 如果设为 true，则仅允许 whitelist 中的 frps 服务器通过 HAProxy 协议连接。
+# 如果设为 false，则插件仅用于调试，允许所有带 HAProxy 协议的连接。
+enable-whitelist: true
+
+# frps 服务器白名单列表 (IP、域名或 CIDR)
+# 域名会在插件加载配置时自动解析为 IP，只有这些地址发送的 HAProxy 数据包会被处理。
+whitelist:
+  - 127.0.0.1
+  - "::1"
