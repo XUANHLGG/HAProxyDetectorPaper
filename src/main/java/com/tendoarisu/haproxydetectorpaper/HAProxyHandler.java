@@ -4,33 +4,32 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.util.AttributeKey;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.logging.Logger;
 
-/**
- * HAProxy 协议注入器
- * 当 Paper 开启 proxy-protocol: true 时：
- * 1. 如果检测到已有 HAProxy 头（frp 玩家），则直接放行。
- * 2. 如果检测到无头（直连玩家），则伪造一个 HAProxy V2 头注入，欺骗 Paper 的解码器。
- */
 public class HAProxyHandler extends ChannelInboundHandlerAdapter {
     private final Logger logger;
-    
-    // HAProxy V2 签名
+    private final boolean whitelistEnabled;
+    private final List<String> whitelist;
+
+    private static final AttributeKey<Boolean> SYNTHETIC_PROXY_MARK = AttributeKey.valueOf("haproxydetectorpaper.synthetic-proxy");
     private static final byte[] V2_SIG = {
         0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
     };
 
-    public HAProxyHandler(Logger logger) {
+    public HAProxyHandler(Logger logger, boolean whitelistEnabled, List<String> whitelist) {
         this.logger = logger;
+        this.whitelistEnabled = whitelistEnabled;
+        this.whitelist = whitelist;
     }
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        // 1. 识别 Geyser 的本地连接 (LocalChannel) 或 EmbeddedChannel
-        // Geyser 插件版通常使用 LocalChannel
         String className = ctx.channel().getClass().getName();
         if (className.contains("LocalChannel") || className.contains("EmbeddedChannel")) {
             ctx.pipeline().remove(this);
@@ -38,7 +37,6 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
             return;
         }
 
-        // 2. 识别 Geyser 的特殊地址特征 (通常是空地址或特定的本地地址)
         SocketAddress remoteAddr = ctx.channel().remoteAddress();
         if (remoteAddr == null || remoteAddr.toString().contains("local")) {
             ctx.pipeline().remove(this);
@@ -48,7 +46,7 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
         if (msg instanceof ByteBuf) {
             ByteBuf buf = (ByteBuf) msg;
-            
+
             if (buf.readableBytes() < 6) {
                 super.channelRead(ctx, msg);
                 return;
@@ -56,37 +54,39 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
 
             buf.markReaderIndex();
             try {
-                // 3. 识别 Geyser 的包头特征 (0xFE 或非标准 Handshake)
-                if (isGeyser(buf)) {
-                    ctx.pipeline().remove(this);
-                    super.channelRead(ctx, msg);
-                    return;
-                }
-
                 int res = isHAProxy(buf);
-                
+
                 if (res == 1) {
-                    // 已经是 HAProxy 协议，放行让 Paper 处理
-                    ctx.pipeline().remove(this);
-                } else if (res == 0) {
-                    // 直连玩家，伪造一个 HAProxy V2 头部
-                    
+                    if (consumeSyntheticProxyMark(ctx)) {
+                        ctx.pipeline().remove(this);
+                    } else {
+                        String frpsIp = getSocketIp(remoteAddr);
+                        if (whitelistEnabled && !isWhitelisted(frpsIp)) {
+                            String clientIp = extractProxyClientIp(buf);
+                            logger.warning("拦截非白名单 frps 连接: frps=" + frpsIp + ", client=" + clientIp);
+                            ctx.close();
+                            return;
+                        }
+
+                        ctx.pipeline().remove(this);
+                    }
+                } else {
+                    if (isGeyser(buf)) {
+                        ctx.pipeline().remove(this);
+                        super.channelRead(ctx, msg);
+                        return;
+                    }
+
                     if (remoteAddr instanceof InetSocketAddress) {
                         InetSocketAddress inetAddr = (InetSocketAddress) remoteAddr;
                         ByteBuf fakeHeader = createV2Header(inetAddr);
-                        
-                        // 将伪造头和原始数据组合
-                        // 使用复合 ByteBuf 或直接组合，确保 Paper 的解码器能读到完整的签名
                         ByteBuf combined = Unpooled.wrappedBuffer(fakeHeader, buf.retain());
-                        
-                        // 移除自己，避免循环处理
+                        ctx.channel().attr(SYNTHETIC_PROXY_MARK).set(Boolean.TRUE);
                         ctx.pipeline().remove(this);
-                        
-                        // 发送组合后的数据包给下一个 Handler (Paper 的 HAProxy 解码器)
                         ctx.fireChannelRead(combined);
                         return;
                     }
-                    
+
                     ctx.pipeline().remove(this);
                 }
             } finally {
@@ -96,98 +96,223 @@ public class HAProxyHandler extends ChannelInboundHandlerAdapter {
         super.channelRead(ctx, msg);
     }
 
-    /**
-     * 创建 HAProxy V2 协议头
-     */
+    private boolean consumeSyntheticProxyMark(ChannelHandlerContext ctx) {
+        return Boolean.TRUE.equals(ctx.channel().attr(SYNTHETIC_PROXY_MARK).getAndSet(null));
+    }
+
     private ByteBuf createV2Header(InetSocketAddress addr) {
         boolean isIPv6 = addr.getAddress() instanceof java.net.Inet6Address;
-        int addressLen = isIPv6 ? 32 : 12; // IPv6: 16+16+2+2=36, IPv4: 4+4+2+2=12
-        
+        int addressLen = isIPv6 ? 32 : 12;
+
         ByteBuf header = Unpooled.buffer(16 + addressLen);
         header.writeBytes(V2_SIG);
-        header.writeByte(0x21); // Ver 2 | Cmd PROXY
-        
+        header.writeByte(0x21);
+
         if (isIPv6) {
-            header.writeByte(0x21); // AF_INET6 (IPv6) | STREAM (TCP)
-            header.writeShort(36);  // 长度
-            header.writeBytes(addr.getAddress().getAddress()); // Source IPv6
-            header.writeBytes(new byte[16]); // Dest IPv6 (可以用全0或回环)
-            header.setByte(header.writerIndex() - 1, 1); // 设置回环地址 ::1
+            header.writeByte(0x21);
+            header.writeShort(36);
+            header.writeBytes(addr.getAddress().getAddress());
+            header.writeBytes(new byte[16]);
+            header.setByte(header.writerIndex() - 1, 1);
         } else {
-            header.writeByte(0x11); // AF_INET (IPv4) | STREAM (TCP)
-            header.writeShort(12);  // 长度
-            header.writeBytes(addr.getAddress().getAddress()); // Source IPv4
-            header.writeBytes(new byte[]{127, 0, 0, 1}); // Dest IPv4
+            header.writeByte(0x11);
+            header.writeShort(12);
+            header.writeBytes(addr.getAddress().getAddress());
+            header.writeBytes(new byte[]{127, 0, 0, 1});
         }
-        
-        header.writeShort(addr.getPort()); // Source Port
-        header.writeShort(25565); // Dest Port (默认端口)
-        
+
+        header.writeShort(addr.getPort());
+        header.writeShort(25565);
         return header;
+    }
+
+    private boolean isWhitelisted(String ip) {
+        if (ip == null || ip.isEmpty()) {
+            return false;
+        }
+
+        for (String entry : whitelist) {
+            if (entry.contains("/")) {
+                if (matchCIDR(ip, entry)) {
+                    return true;
+                }
+            } else if (entry.equalsIgnoreCase(ip)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchCIDR(String ip, String cidr) {
+        try {
+            String[] parts = cidr.split("/");
+            String network = parts[0];
+            int prefix = Integer.parseInt(parts[1]);
+
+            InetAddress addr = InetAddress.getByName(ip);
+            InetAddress netAddr = InetAddress.getByName(network);
+
+            byte[] addrBytes = addr.getAddress();
+            byte[] netBytes = netAddr.getAddress();
+
+            if (addrBytes.length != netBytes.length) {
+                return false;
+            }
+
+            int fullBytes = prefix / 8;
+            int remainingBits = prefix % 8;
+
+            for (int i = 0; i < fullBytes; i++) {
+                if (addrBytes[i] != netBytes[i]) {
+                    return false;
+                }
+            }
+
+            if (remainingBits > 0) {
+                int mask = (0xFF << (8 - remainingBits)) & 0xFF;
+                return (addrBytes[fullBytes] & mask) == (netBytes[fullBytes] & mask);
+            }
+
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private int isHAProxy(ByteBuf buf) {
         int readerIndex = buf.readerIndex();
         int readableBytes = buf.readableBytes();
 
-        // V1 Check
-        if (readableBytes >= 6) {
-            if (buf.getByte(readerIndex) == 'P' &&
-                buf.getByte(readerIndex + 1) == 'R' &&
-                buf.getByte(readerIndex + 2) == 'O' &&
-                buf.getByte(readerIndex + 3) == 'X' &&
-                buf.getByte(readerIndex + 4) == 'Y' &&
-                buf.getByte(readerIndex + 5) == ' ') {
-                return 1;
-            }
+        if (matchesV1Signature(buf, readerIndex, readableBytes)) {
+            return 1;
         }
 
-        // V2 Check
-        if (readableBytes >= 12) {
-            for (int i = 0; i < V2_SIG.length; i++) {
-                if (buf.getByte(readerIndex + i) != V2_SIG[i]) {
-                    return 0;
-                }
-            }
+        if (matchesV2Signature(buf, readerIndex, readableBytes)) {
             return 1;
         }
 
         return 0;
     }
 
-    /**
-     * 判断是否为 Geyser (Bedrock) 流量
-     * Geyser 内部通信（如插件模式下的 Bedrock 连接）通常会包含特定的魔数或包结构
-     */
     private boolean isGeyser(ByteBuf buf) {
         int readableBytes = buf.readableBytes();
-        if (readableBytes < 1) return false;
+        if (readableBytes < 1) {
+            return false;
+        }
 
         int firstByte = buf.getByte(buf.readerIndex()) & 0xFF;
-
-        // 1. 传统的 Geyser/Bedrock 握手标识 (0xFE)
         if (firstByte == 0xFE) {
             return true;
         }
 
-        // 2. Geyser 使用 MCProtocolLib 建立的 LocalSession 流量
-        // 这种流量通常是 VarInt 开头的 Minecraft 数据包
-        // 如果第一个字节是 VarInt 格式且后续符合 Minecraft 握手包特征，我们再细化判断
         if (readableBytes >= 2) {
-            int length = firstByte; // 简化判断，通常握手包长度较小
             int packetId = buf.getByte(buf.readerIndex() + 1) & 0xFF;
-            
-            // 如果 Packet ID 为 0x00 (Handshake)，且长度看起来像是一个 VarInt
-            // 正常 Java 直连的 Handshake 会被注入，但 Geyser 的流量可能由于是 LocalChannel 
-            // 在某些环境下表现不同。
-            // 核心逻辑：如果是标准的 Java Handshake (0x00)，我们交给注入逻辑；
-            // 如果不是标准的 Handshake，或者是 Geyser 特有的包，则放行。
             if (firstByte > 0 && packetId != 0x00) {
-                // 非握手包头的流量，大概率是 Geyser 的内部通信包
                 return true;
             }
         }
 
         return false;
+    }
+
+    private boolean matchesV1Signature(ByteBuf buf, int readerIndex, int readableBytes) {
+        return readableBytes >= 6
+            && buf.getByte(readerIndex) == 'P'
+            && buf.getByte(readerIndex + 1) == 'R'
+            && buf.getByte(readerIndex + 2) == 'O'
+            && buf.getByte(readerIndex + 3) == 'X'
+            && buf.getByte(readerIndex + 4) == 'Y'
+            && buf.getByte(readerIndex + 5) == ' ';
+    }
+
+    private boolean matchesV2Signature(ByteBuf buf, int readerIndex, int readableBytes) {
+        if (readableBytes < 12) {
+            return false;
+        }
+
+        for (int i = 0; i < V2_SIG.length; i++) {
+            if (buf.getByte(readerIndex + i) != V2_SIG[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private String getSocketIp(SocketAddress remoteAddr) {
+        if (remoteAddr instanceof InetSocketAddress inetSocketAddress) {
+            InetAddress address = inetSocketAddress.getAddress();
+            if (address != null) {
+                return address.getHostAddress();
+            }
+            return inetSocketAddress.getHostString();
+        }
+        return "unknown";
+    }
+
+    private String extractProxyClientIp(ByteBuf buf) {
+        int readerIndex = buf.readerIndex();
+        int readableBytes = buf.readableBytes();
+
+        if (matchesV1Signature(buf, readerIndex, readableBytes)) {
+            int lineEnd = findLineEnd(buf, readerIndex, readableBytes);
+            int length = lineEnd == -1 ? readableBytes : lineEnd - readerIndex;
+            String header = buf.toString(readerIndex, length, StandardCharsets.US_ASCII).trim();
+            String[] parts = header.split("\\s+");
+            if (parts.length >= 3) {
+                return parts[2];
+            }
+            return "unknown";
+        }
+
+        if (!matchesV2Signature(buf, readerIndex, readableBytes) || readableBytes < 16) {
+            return "unknown";
+        }
+
+        try {
+            int versionCommand = buf.getUnsignedByte(readerIndex + 12);
+            if ((versionCommand >> 4) != 0x2) {
+                return "unknown";
+            }
+
+            int familyProtocol = buf.getUnsignedByte(readerIndex + 13);
+            int headerLength = buf.getUnsignedShort(readerIndex + 14);
+            if (readableBytes < 16 + headerLength) {
+                return "unknown";
+            }
+
+            int family = familyProtocol & 0xF0;
+            if (family == 0x10) {
+                if (headerLength < 12) {
+                    return "unknown";
+                }
+                byte[] source = new byte[4];
+                buf.getBytes(readerIndex + 16, source);
+                return InetAddress.getByAddress(source).getHostAddress();
+            }
+
+            if (family == 0x20) {
+                if (headerLength < 36) {
+                    return "unknown";
+                }
+                byte[] source = new byte[16];
+                buf.getBytes(readerIndex + 16, source);
+                return InetAddress.getByAddress(source).getHostAddress();
+            }
+        } catch (Exception ignored) {
+            return "unknown";
+        }
+
+        return "unknown";
+    }
+
+    private int findLineEnd(ByteBuf buf, int readerIndex, int readableBytes) {
+        int maxIndex = readerIndex + readableBytes - 1;
+        for (int i = readerIndex; i < maxIndex; i++) {
+            if (buf.getByte(i) == '\r' && buf.getByte(i + 1) == '\n') {
+                return i;
+            }
+        }
+        return -1;
     }
 }
