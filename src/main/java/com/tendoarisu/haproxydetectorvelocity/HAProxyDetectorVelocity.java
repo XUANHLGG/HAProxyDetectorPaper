@@ -34,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @Plugin(
         id = "haproxydetectorvelocity",
         name = "HAProxyDetectorVelocity",
-        version = "1.3",
+        version = "@version@",
         description = "Allow mixed HAProxy and direct connections for Velocity",
         authors = {"TendoArisu"}
 )
