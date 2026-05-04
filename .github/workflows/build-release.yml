@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*' 
+  workflow_dispatch: 
+
+env:
+  java-version: '21' # 提取到环境变量方便统一修改
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+          submodules: true # 开启子模块拉取
+
+      - name: Set up JDK ${{ env.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.java-version }}
+          cache: 'gradle'
+
+      - name: Build with Gradle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew build
+
+      # 必须的补充：生成一个临时日志文件，防止 mc-publish 找不到 CHANGELOG.txt 报错
+      - name: Generate simple Changelog
+        run: |
+          echo "## Release ${{ github.ref_name }}" > CHANGELOG.txt
+          echo "自动构建发布的版本。" >> CHANGELOG.txt
+
+      - name: Publish to GitHub
+        uses: Kir-Antipov/mc-publish@v3.3
+        with:
+          # 修正：直接使用触发该 Action 的 tag 名称（例如 v1.4）作为标题和标签
+          name: Release ${{ github.ref_name }}
+          changelog-file: CHANGELOG.txt
+
+          github-tag: ${{ github.ref_name }}
+          github-commitish: ${{ github.sha }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-draft: false
+          github-prerelease: false
+
+          files: |
+            build/libs/!(*-@(dev|sources|javadoc)).jar
