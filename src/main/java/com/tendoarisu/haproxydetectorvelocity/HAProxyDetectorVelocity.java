@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -311,8 +312,8 @@ public class HAProxyDetectorVelocity {
                         } else {
                             SocketAddress remoteAddr = ctx.channel().remoteAddress();
                             String frpsIp = getSocketIp(remoteAddr);
-                            if (whitelistEnabled && !isWhitelisted(frpsIp)) {
-                                String clientIp = extractProxyClientIp(buf);
+                            String clientIp = extractProxyClientIp(buf);
+                            if (whitelistEnabled && !isWhitelisted(frpsIp) && !isGeyserProxyConnection(ctx)) {
                                 logger.warn("拦截非白名单 frps 连接: frps={}, client={}", frpsIp, clientIp);
                                 ctx.close();
                                 return;
@@ -398,6 +399,52 @@ public class HAProxyDetectorVelocity {
                 }
             }
             return false;
+        }
+
+        private boolean isGeyserProxyConnection(ChannelHandlerContext ctx) {
+            if (containsGeyserMarker(ctx.channel().getClass().getName())) {
+                return true;
+            }
+
+            Channel parent = ctx.channel().parent();
+            if (parent != null && containsGeyserMarker(parent.getClass().getName())) {
+                return true;
+            }
+
+            SocketAddress localAddress = ctx.channel().localAddress();
+            if (localAddress != null && (containsGeyserMarker(localAddress.getClass().getName()) || containsGeyserMarker(localAddress.toString()))) {
+                return true;
+            }
+
+            SocketAddress remoteAddress = ctx.channel().remoteAddress();
+            if (remoteAddress != null && containsGeyserMarker(remoteAddress.getClass().getName())) {
+                return true;
+            }
+
+            for (String name : ctx.pipeline().names()) {
+                if (containsGeyserMarker(name)) {
+                    return true;
+                }
+
+                try {
+                    Object handler = ctx.pipeline().get(name);
+                    if (handler != null && containsGeyserMarker(handler.getClass().getName())) {
+                        return true;
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
+            return false;
+        }
+
+        private boolean containsGeyserMarker(String value) {
+            if (value == null) {
+                return false;
+            }
+
+            String normalized = value.toLowerCase(Locale.ROOT);
+            return normalized.contains("geyser") || normalized.contains("floodgate");
         }
 
         private boolean matchCIDR(String ip, String cidr) {
