@@ -1,11 +1,17 @@
-# HAProxyDetector 配置
+# HAProxyDetector configuration / 配置
 # --------------------
 
+# Log language: en_US or zh_CN. Leave blank to detect and save the OS/JVM language.
+# 日志语言：en_US 或 zh_CN。留空时检测系统/JVM 语言并写回配置。
+language:
+
+# Only allow whitelisted frps sources to use PROXY Protocol.
 # 是否开启白名单检查
 # 如果设为 true，则仅允许 whitelist 中的 frps 服务器通过 HAProxy 协议连接。
 # 如果设为 false，则插件仅用于调试，允许所有带 HAProxy 协议的连接。
 enable-whitelist: true
 
+# Trusted frps sources: IP, domain name, or CIDR. Domains resolve at startup.
 # frps 服务器白名单列表 (IP、域名或 CIDR)
 # 域名会在插件加载配置时自动解析为 IP，只有这些地址发送的 HAProxy 数据包会被处理。
 whitelist:

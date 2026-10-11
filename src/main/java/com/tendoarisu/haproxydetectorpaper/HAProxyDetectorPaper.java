@@ -1,5 +1,10 @@
 package com.tendoarisu.haproxydetectorpaper;
 
+import com.tendoarisu.haproxydetector.common.IpWhitelist;
+import com.tendoarisu.haproxydetector.common.MessageKey;
+import com.tendoarisu.haproxydetector.common.Messages;
+import com.tendoarisu.haproxydetector.common.ProxyLogger;
+import com.tendoarisu.haproxydetector.common.ProxyProtocolSupport;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
@@ -10,7 +15,6 @@ import org.bukkit.plugin.java.JavaPlugin;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -24,69 +28,51 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
 
     private boolean proxyProtocolEnabled = false;
     private boolean whitelistEnabled = true;
-    private List<String> whitelist = new ArrayList<>();
+    private IpWhitelist whitelist;
+    private Messages messages = Messages.system();
+    private ProxyLogger proxyLogger;
     private final Set<Channel> injectedServerChannels = ConcurrentHashMap.newKeySet();
     private final Set<Channel> injectedChildChannels = ConcurrentHashMap.newKeySet();
     private volatile boolean nettyActive = false;
 
     @Override
     public void onEnable() {
-        saveDefaultConfig();
-        loadPluginConfig();
-
         try {
+            saveDefaultConfig();
+            loadPluginConfig();
             checkProxyProtocol();
             if (!proxyProtocolEnabled) {
-                getLogger().warning("检测到 Paper 未开启 proxy-protocol，插件将自动禁用。");
+                getLogger().warning(messages.get(MessageKey.PROXY_DISABLED, "Paper", "proxy-protocol"));
                 Bukkit.getPluginManager().disablePlugin(this);
                 return;
             }
 
-            injectNetty();
             nettyActive = true;
-            getLogger().info("HAProxyDetector 已成功注入 Netty 流。");
+            injectNetty();
+            getLogger().info(messages.get(MessageKey.NETTY_INJECTED));
             if (!whitelistEnabled) {
-                getLogger().warning("注意：白名单检查已禁用，当前处于调试模式（允许所有 HAProxy 连接）。");
+                getLogger().warning(messages.get(MessageKey.WHITELIST_DISABLED));
             }
         } catch (Exception e) {
             nettyActive = false;
             detachNetty();
-            getLogger().log(Level.SEVERE, "注入 Netty 时出错: ", e);
+            getLogger().log(Level.SEVERE, messages.get(MessageKey.NETTY_INJECTION_FAILED), e);
         }
     }
 
     private void loadPluginConfig() {
         reloadConfig();
-        whitelistEnabled = getConfig().getBoolean("enable-whitelist", true);
-        whitelist = resolveWhitelistEntries(getConfig().getStringList("whitelist"));
-    }
-
-    private List<String> resolveWhitelistEntries(List<String> entries) {
-        List<String> resolvedEntries = new ArrayList<>();
-        for (String entry : entries) {
-            if (entry == null) {
-                continue;
-            }
-
-            String normalized = entry.trim();
-            if (normalized.isEmpty()) {
-                continue;
-            }
-
-            if (normalized.contains("/")) {
-                resolvedEntries.add(normalized);
-                continue;
-            }
-
-            try {
-                for (InetAddress address : InetAddress.getAllByName(normalized)) {
-                    resolvedEntries.add(address.getHostAddress());
-                }
-            } catch (Exception ignored) {
-                resolvedEntries.add(normalized);
-            }
+        String language = getConfig().getString("language", Messages.DEFAULT_LANGUAGE);
+        messages = Messages.select(language,
+                (message, exception) -> getLogger().log(Level.WARNING, message, exception));
+        if (Messages.needsDetection(language)) {
+            getConfig().set("language", messages.language());
+            saveConfig();
         }
-        return resolvedEntries;
+        proxyLogger = ProxyLogger.localized(messages,
+                (message, exception) -> getLogger().log(Level.WARNING, message, exception));
+        whitelistEnabled = getConfig().getBoolean("enable-whitelist", true);
+        whitelist = IpWhitelist.resolve(whitelistEnabled, getConfig().getStringList("whitelist"), proxyLogger);
     }
 
     private void checkProxyProtocol() {
@@ -101,6 +87,7 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
             Field proxyProtocolField = proxiesObj.getClass().getField("proxyProtocol");
             proxyProtocolEnabled = proxyProtocolField.getBoolean(proxiesObj);
         } catch (Exception e) {
+            getLogger().log(Level.WARNING, messages.get(MessageKey.PAPER_PROXY_CONFIG_FAILED), e);
             proxyProtocolEnabled = true;
         }
     }
@@ -148,7 +135,8 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
                                 }
                             }
                         }
-                    } catch (Exception ignored) {
+                    } catch (Exception exception) {
+                        getLogger().log(Level.WARNING, messages.get(MessageKey.PAPER_CONNECTION_PROBE_FAILED), exception);
                     }
                     if (serverConnection != null) {
                         break;
@@ -162,7 +150,7 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
         }
 
         if (serverConnection == null) {
-            throw new IllegalStateException("无法在当前服务端版本中定位 ServerConnection 实例");
+            throw new IllegalStateException(messages.get(MessageKey.PAPER_CONNECTION_MISSING));
         }
 
         List<ChannelFuture> channelFutures = null;
@@ -182,8 +170,8 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
             }
         }
 
-        if (channelFutures == null) {
-            return;
+        if (channelFutures == null || channelFutures.isEmpty()) {
+            throw new IllegalStateException(messages.get(MessageKey.PAPER_LISTENER_MISSING));
         }
 
         for (ChannelFuture future : channelFutures) {
@@ -205,6 +193,8 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
     private void detachNetty() {
         for (Channel channel : new ArrayList<>(injectedChildChannels)) {
             removeHandler(channel, CONNECTION_HANDLER_NAME);
+            removeHandler(channel, ProxyProtocolSupport.DETECTOR_NAME);
+            removeHandler(channel, ProxyProtocolSupport.VALIDATOR_NAME);
         }
         injectedChildChannels.clear();
 
@@ -225,7 +215,8 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
                 if (pipeline.get(handlerName) != null) {
                     pipeline.remove(handlerName);
                 }
-            } catch (Exception ignored) {
+            } catch (Exception exception) {
+                getLogger().log(Level.WARNING, messages.get(MessageKey.NETTY_REMOVAL_FAILED), exception);
             }
         };
 
@@ -235,7 +226,8 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
             } else {
                 channel.eventLoop().execute(removeTask);
             }
-        } catch (Exception ignored) {
+        } catch (Exception exception) {
+            getLogger().log(Level.WARNING, messages.get(MessageKey.NETTY_REMOVAL_FAILED), exception);
         }
     }
 
@@ -251,7 +243,7 @@ public final class HAProxyDetectorPaper extends JavaPlugin {
             if (msg instanceof Channel childChannel) {
                 ChannelPipeline pipeline = childChannel.pipeline();
                 if (pipeline.get(CONNECTION_HANDLER_NAME) == null) {
-                    pipeline.addFirst(CONNECTION_HANDLER_NAME, new HAProxyHandler(getLogger(), whitelistEnabled, whitelist));
+                    pipeline.addFirst(CONNECTION_HANDLER_NAME, new HAProxyHandler(whitelist, proxyLogger));
                     trackChannel(injectedChildChannels, childChannel);
                 }
             }

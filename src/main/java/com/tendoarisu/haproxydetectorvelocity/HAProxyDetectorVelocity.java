@@ -1,60 +1,62 @@
 package com.tendoarisu.haproxydetectorvelocity;
 
 import com.google.inject.Inject;
+import com.tendoarisu.haproxydetector.common.IpWhitelist;
+import com.tendoarisu.haproxydetector.common.LanguageConfig;
+import com.tendoarisu.haproxydetector.common.MessageKey;
+import com.tendoarisu.haproxydetector.common.Messages;
+import com.tendoarisu.haproxydetector.common.ProxyLogger;
+import com.tendoarisu.haproxydetector.common.ProxyProtocolSupport;
 import com.velocitypowered.api.event.Subscribe;
 import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;
 import com.velocitypowered.api.event.proxy.ProxyShutdownEvent;
 import com.velocitypowered.api.plugin.Plugin;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.ProxyServer;
-import io.netty.buffer.ByteBuf;
-import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.util.AttributeKey;
-import org.slf4j.Logger;
-
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelPipeline;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.SocketAddress;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
 
 @Plugin(
         id = "haproxydetectorvelocity",
         name = "HAProxyDetectorVelocity",
-        version = "1.3",
-        description = "Allow mixed HAProxy and direct connections for Velocity",
+        version = "1.5",
+        description = "Accept trusted HAProxy connections and ordinary direct connections on one port",
         authors = {"TendoArisu"}
 )
-public class HAProxyDetectorVelocity {
+public final class HAProxyDetectorVelocity {
 
-    private static final String INJECTOR_NAME = "haproxydetectorvelocity-injector";
-    private static final String CONNECTION_HANDLER_NAME = "haproxydetectorvelocity-handler";
+    private static final String DELEGATE_INITIALIZER = "haproxydetectorvelocity-delegate";
 
     private final ProxyServer server;
     private final Logger logger;
     private final Path dataDirectory;
-    private boolean whitelistEnabled = true;
-    private List<String> whitelist = new ArrayList<>();
-    private final Set<Channel> injectedServerChannels = ConcurrentHashMap.newKeySet();
-    private final Set<Channel> injectedChildChannels = ConcurrentHashMap.newKeySet();
-    private volatile boolean nettyActive = false;
+    private Messages messages = Messages.system();
+    private ProxyLogger proxyLogger;
+
+    private Object initializerHolder;
+    private ChannelInitializer<Channel> originalInitializer;
+    private ChannelInitializer<Channel> wrappedInitializer;
+    private Method holderGetMethod;
+    private Method holderSetMethod;
 
     @Inject
-    public HAProxyDetectorVelocity(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
+    public HAProxyDetectorVelocity(
+            ProxyServer server,
+            Logger logger,
+            @DataDirectory Path dataDirectory
+    ) {
         this.server = server;
         this.logger = logger;
         this.dataDirectory = dataDirectory;
@@ -63,42 +65,132 @@ public class HAProxyDetectorVelocity {
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
         try {
-            loadConfig();
-            injectNetty();
-            nettyActive = true;
-            logger.info("HAProxyDetectorVelocity 已成功注入 Netty 流。");
-        } catch (Exception e) {
-            nettyActive = false;
-            detachNetty();
-            logger.error("注入 Velocity Netty 时出错: ", e);
+            PluginConfig config = loadConfig();
+            messages = Messages.select(config.language(), logger::warn);
+            proxyLogger = ProxyLogger.localized(messages, logger::warn);
+            if (!isProxyProtocolEnabled()) {
+                logger.warn(messages.get(MessageKey.PROXY_DISABLED, "Velocity", "haproxy-protocol"));
+                return;
+            }
+            IpWhitelist whitelist = IpWhitelist.resolve(config.whitelistEnabled(), config.whitelist(), proxyLogger);
+            installInitializerWrapper(whitelist);
+            logger.info(messages.get(MessageKey.NETTY_INJECTED));
+            if (!config.whitelistEnabled()) {
+                logger.warn(messages.get(MessageKey.WHITELIST_DISABLED));
+            }
+        } catch (Exception exception) {
+            restoreInitializer();
+            logger.error(messages.get(MessageKey.NETTY_INJECTION_FAILED), exception);
         }
     }
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
-        nettyActive = false;
-        detachNetty();
+        restoreInitializer();
     }
 
-    private void loadConfig() throws IOException {
+    private boolean isProxyProtocolEnabled() throws ReflectiveOperationException {
+        Object configuration = server.getConfiguration();
+        Method isProxyProtocol = configuration.getClass().getMethod("isProxyProtocol");
+        return (boolean) isProxyProtocol.invoke(configuration);
+    }
+
+    private void installInitializerWrapper(IpWhitelist whitelist) throws ReflectiveOperationException {
+        Object connectionManager = findConnectionManager();
+        Method getInitializerHolder = connectionManager.getClass().getMethod("getServerChannelInitializer");
+        Object holder = getInitializerHolder.invoke(connectionManager);
+
+        Method getMethod = holder.getClass().getMethod("get");
+        Method setMethod = holder.getClass().getMethod("set", ChannelInitializer.class);
+        Object currentInitializer = getMethod.invoke(holder);
+        if (!(currentInitializer instanceof ChannelInitializer<?> channelInitializer)) {
+            throw new IllegalStateException(messages.get(MessageKey.VELOCITY_INITIALIZER_INVALID));
+        }
+
+        @SuppressWarnings("unchecked")
+        ChannelInitializer<Channel> typedInitializer = (ChannelInitializer<Channel>) channelInitializer;
+        ChannelInitializer<Channel> wrapper = new MixedProxyChannelInitializer(typedInitializer, whitelist);
+
+        this.initializerHolder = holder;
+        this.originalInitializer = typedInitializer;
+        this.wrappedInitializer = wrapper;
+        this.holderGetMethod = getMethod;
+        this.holderSetMethod = setMethod;
+
+        setMethod.invoke(holder, wrapper);
+    }
+
+    private Object findConnectionManager() throws ReflectiveOperationException {
+        Class<?> currentClass = server.getClass();
+        while (currentClass != null && currentClass != Object.class) {
+            for (Field field : currentClass.getDeclaredFields()) {
+                if (!field.getType().getSimpleName().equals("ConnectionManager")) {
+                    continue;
+                }
+
+                field.setAccessible(true);
+                Object connectionManager = field.get(server);
+                if (connectionManager != null) {
+                    return connectionManager;
+                }
+            }
+            currentClass = currentClass.getSuperclass();
+        }
+        throw new IllegalStateException(messages.get(MessageKey.VELOCITY_CONNECTION_MANAGER_MISSING));
+    }
+
+    private void restoreInitializer() {
+        if (initializerHolder == null || originalInitializer == null || wrappedInitializer == null
+                || holderGetMethod == null || holderSetMethod == null) {
+            return;
+        }
+
+        try {
+            Object current = holderGetMethod.invoke(initializerHolder);
+            if (current == wrappedInitializer) {
+                holderSetMethod.invoke(initializerHolder, originalInitializer);
+            }
+        } catch (ReflectiveOperationException exception) {
+            logger.warn(messages.get(MessageKey.NETTY_REMOVAL_FAILED), exception);
+        } finally {
+            initializerHolder = null;
+            originalInitializer = null;
+            wrappedInitializer = null;
+            holderGetMethod = null;
+            holderSetMethod = null;
+        }
+    }
+
+    private PluginConfig loadConfig() throws IOException {
         Files.createDirectories(dataDirectory);
         Path configPath = dataDirectory.resolve("config.yml");
         if (Files.notExists(configPath)) {
             try (InputStream inputStream = getClass().getClassLoader().getResourceAsStream("config.yml")) {
                 if (inputStream == null) {
-                    throw new IOException("未找到内置 config.yml");
+                    throw new IOException(messages.get(MessageKey.CONFIG_RESOURCE_MISSING));
                 }
                 Files.copy(inputStream, configPath, StandardCopyOption.REPLACE_EXISTING);
             }
         }
 
-        whitelistEnabled = true;
-        whitelist = new ArrayList<>();
+        boolean whitelistEnabled = true;
+        String language = Messages.DEFAULT_LANGUAGE;
+        int languageLine = -1;
+        List<String> whitelist = new ArrayList<>();
         boolean readingWhitelist = false;
 
-        for (String line : Files.readAllLines(configPath, StandardCharsets.UTF_8)) {
+        List<String> lines = Files.readAllLines(configPath, StandardCharsets.UTF_8);
+        for (int lineIndex = 0; lineIndex < lines.size(); lineIndex++) {
+            String line = lines.get(lineIndex);
             String trimmed = stripComment(line).trim();
             if (trimmed.isEmpty()) {
+                continue;
+            }
+
+            if (trimmed.startsWith("language:")) {
+                language = normalizeYamlValue(trimmed.substring("language:".length()).trim());
+                languageLine = lineIndex;
+                readingWhitelist = false;
                 continue;
             }
 
@@ -129,459 +221,56 @@ public class HAProxyDetectorVelocity {
             }
         }
 
-        whitelist = resolveWhitelistEntries(whitelist);
+        if (Messages.needsDetection(language)) {
+            language = Messages.system().language();
+            LanguageConfig.saveDetectedLanguage(configPath, lines, languageLine, language);
+        }
+        return new PluginConfig(language, whitelistEnabled, whitelist);
     }
 
     private String stripComment(String line) {
         boolean inSingleQuote = false;
         boolean inDoubleQuote = false;
-        for (int i = 0; i < line.length(); i++) {
-            char current = line.charAt(i);
+        for (int index = 0; index < line.length(); index++) {
+            char current = line.charAt(index);
             if (current == '\'' && !inDoubleQuote) {
                 inSingleQuote = !inSingleQuote;
             } else if (current == '"' && !inSingleQuote) {
                 inDoubleQuote = !inDoubleQuote;
             } else if (current == '#' && !inSingleQuote && !inDoubleQuote) {
-                return line.substring(0, i);
+                return line.substring(0, index);
             }
         }
         return line;
     }
 
     private String normalizeYamlValue(String value) {
-        if (value.length() >= 2) {
-            if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("'") && value.endsWith("'"))) {
-                return value.substring(1, value.length() - 1);
-            }
+        if (value.length() >= 2
+                && ((value.startsWith("\"") && value.endsWith("\""))
+                || (value.startsWith("'") && value.endsWith("'")))) {
+            return value.substring(1, value.length() - 1);
         }
         return value;
     }
 
-    private List<String> resolveWhitelistEntries(List<String> entries) {
-        List<String> resolvedEntries = new ArrayList<>();
-        for (String entry : entries) {
-            if (entry == null) {
-                continue;
-            }
+    private final class MixedProxyChannelInitializer extends ChannelInitializer<Channel> {
+        private final ChannelInitializer<Channel> delegate;
+        private final IpWhitelist whitelist;
 
-            String normalized = entry.trim();
-            if (normalized.isEmpty()) {
-                continue;
-            }
-
-            if (normalized.contains("/")) {
-                resolvedEntries.add(normalized);
-                continue;
-            }
-
-            try {
-                for (InetAddress address : InetAddress.getAllByName(normalized)) {
-                    resolvedEntries.add(address.getHostAddress());
-                }
-            } catch (Exception ignored) {
-                resolvedEntries.add(normalized);
-            }
-        }
-        return resolvedEntries;
-    }
-
-    private void injectNetty() throws Exception {
-        Object cm = null;
-        for (Field field : server.getClass().getDeclaredFields()) {
-            if (field.getType().getSimpleName().contains("ConnectionManager")) {
-                field.setAccessible(true);
-                cm = field.get(server);
-                break;
-            }
-        }
-
-        if (cm == null) {
-            return;
-        }
-
-        for (Field field : cm.getClass().getDeclaredFields()) {
-            if (List.class.isAssignableFrom(field.getType())) {
-                field.setAccessible(true);
-                List<?> list = (List<?>) field.get(cm);
-                if (list != null && !list.isEmpty() && list.get(0) instanceof ChannelFuture) {
-                    List<ChannelFuture> futures = (List<ChannelFuture>) list;
-                    for (ChannelFuture future : futures) {
-                        Channel serverChannel = future.channel();
-                        if (serverChannel.pipeline().get(INJECTOR_NAME) == null) {
-                            serverChannel.pipeline().addFirst(INJECTOR_NAME, new ServerInjectHandler());
-                        }
-                        trackChannel(injectedServerChannels, serverChannel);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    private void trackChannel(Set<Channel> channelSet, Channel channel) {
-        if (channelSet.add(channel)) {
-            channel.closeFuture().addListener(future -> channelSet.remove(channel));
-        }
-    }
-
-    private void detachNetty() {
-        for (Channel channel : new ArrayList<>(injectedChildChannels)) {
-            removeHandler(channel, CONNECTION_HANDLER_NAME);
-        }
-        injectedChildChannels.clear();
-
-        for (Channel channel : new ArrayList<>(injectedServerChannels)) {
-            removeHandler(channel, INJECTOR_NAME);
-        }
-        injectedServerChannels.clear();
-    }
-
-    private void removeHandler(Channel channel, String handlerName) {
-        if (channel == null) {
-            return;
-        }
-
-        Runnable removeTask = () -> {
-            try {
-                if (channel.pipeline().get(handlerName) != null) {
-                    channel.pipeline().remove(handlerName);
-                }
-            } catch (Exception ignored) {
-            }
-        };
-
-        try {
-            if (channel.eventLoop().inEventLoop()) {
-                removeTask.run();
-            } else {
-                channel.eventLoop().execute(removeTask);
-            }
-        } catch (Exception ignored) {
-        }
-    }
-
-    private class ServerInjectHandler extends ChannelInboundHandlerAdapter {
-        @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-            if (!nettyActive) {
-                removeHandler(ctx.channel(), INJECTOR_NAME);
-                super.channelRead(ctx, msg);
-                return;
-            }
-
-            if (msg instanceof Channel childChannel) {
-                if (childChannel.pipeline().get(CONNECTION_HANDLER_NAME) == null) {
-                    childChannel.pipeline().addFirst(CONNECTION_HANDLER_NAME, new HAProxyHandler(logger, whitelistEnabled, whitelist));
-                    trackChannel(injectedChildChannels, childChannel);
-                }
-            }
-            super.channelRead(ctx, msg);
-        }
-    }
-
-    public static class HAProxyHandler extends ChannelInboundHandlerAdapter {
-        private final Logger logger;
-        private final boolean whitelistEnabled;
-        private final List<String> whitelist;
-        private static final AttributeKey<Boolean> SYNTHETIC_PROXY_MARK = AttributeKey.valueOf("haproxydetectorvelocity.synthetic-proxy");
-        private static final byte[] V2_SIG = {
-                0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A
-        };
-
-        public HAProxyHandler(Logger logger, boolean whitelistEnabled, List<String> whitelist) {
-            this.logger = logger;
-            this.whitelistEnabled = whitelistEnabled;
-            this.whitelist = new ArrayList<>(whitelist);
+        private MixedProxyChannelInitializer(ChannelInitializer<Channel> delegate, IpWhitelist whitelist) {
+            this.delegate = delegate;
+            this.whitelist = whitelist;
         }
 
         @Override
-        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-            if (msg instanceof ByteBuf) {
-                ByteBuf buf = (ByteBuf) msg;
-                if (buf.readableBytes() < 6) {
-                    super.channelRead(ctx, msg);
-                    return;
-                }
+        protected void initChannel(Channel channel) {
+            ChannelPipeline pipeline = channel.pipeline();
+            pipeline.addLast(DELEGATE_INITIALIZER, delegate);
 
-                buf.markReaderIndex();
-                try {
-                    int res = isHAProxy(buf);
-                    if (res == 1) {
-                        if (consumeSyntheticProxyMark(ctx)) {
-                            ctx.pipeline().remove(this);
-                        } else {
-                            SocketAddress remoteAddr = ctx.channel().remoteAddress();
-                            String frpsIp = getSocketIp(remoteAddr);
-                            String clientIp = extractProxyClientIp(buf);
-                            if (whitelistEnabled && !isWhitelisted(frpsIp) && !isGeyserProxyConnection(ctx)) {
-                                logger.warn("拦截非白名单 frps 连接: frps={}, client={}", frpsIp, clientIp);
-                                ctx.close();
-                                return;
-                            }
-                            ctx.pipeline().remove(this);
-                        }
-                    } else {
-                        SocketAddress remoteAddr = ctx.channel().remoteAddress();
-                        if (remoteAddr instanceof InetSocketAddress inetAddr) {
-                            ByteBuf fakeHeader = createV2Header(inetAddr);
-                            ByteBuf combined = Unpooled.wrappedBuffer(fakeHeader, buf.retain());
-                            ctx.channel().attr(SYNTHETIC_PROXY_MARK).set(Boolean.TRUE);
-                            ctx.pipeline().remove(this);
-                            ctx.fireChannelRead(combined);
-                            return;
-                        }
-                        ctx.pipeline().remove(this);
-                    }
-                } finally {
-                    buf.resetReaderIndex();
-                }
-            }
-            super.channelRead(ctx, msg);
+            ProxyProtocolSupport.install(pipeline, whitelist, proxyLogger);
         }
+    }
 
-        private boolean consumeSyntheticProxyMark(ChannelHandlerContext ctx) {
-            return Boolean.TRUE.equals(ctx.channel().attr(SYNTHETIC_PROXY_MARK).getAndSet(null));
-        }
-
-        private int isHAProxy(ByteBuf buf) {
-            int readerIndex = buf.readerIndex();
-            int readableBytes = buf.readableBytes();
-
-            if (matchesV1Signature(buf, readerIndex, readableBytes)) {
-                return 1;
-            }
-
-            if (matchesV2Signature(buf, readerIndex, readableBytes)) {
-                return 1;
-            }
-
-            return 0;
-        }
-
-        private ByteBuf createV2Header(InetSocketAddress addr) {
-            boolean isIPv6 = addr.getAddress() instanceof java.net.Inet6Address;
-            int addressLen = isIPv6 ? 32 : 12;
-
-            ByteBuf header = Unpooled.buffer(16 + addressLen);
-            header.writeBytes(V2_SIG);
-            header.writeByte(0x21);
-
-            if (isIPv6) {
-                header.writeByte(0x21);
-                header.writeShort(36);
-                header.writeBytes(addr.getAddress().getAddress());
-                header.writeBytes(new byte[16]);
-                header.setByte(header.writerIndex() - 1, 1);
-            } else {
-                header.writeByte(0x11);
-                header.writeShort(12);
-                header.writeBytes(addr.getAddress().getAddress());
-                header.writeBytes(new byte[]{127, 0, 0, 1});
-            }
-
-            header.writeShort(addr.getPort());
-            header.writeShort(25565);
-            return header;
-        }
-
-        private boolean isWhitelisted(String ip) {
-            if (ip == null || ip.isEmpty()) {
-                return false;
-            }
-
-            for (String entry : whitelist) {
-                if (entry.contains("/")) {
-                    if (matchCIDR(ip, entry)) {
-                        return true;
-                    }
-                } else if (entry.equalsIgnoreCase(ip)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private boolean isGeyserProxyConnection(ChannelHandlerContext ctx) {
-            if (containsGeyserMarker(ctx.channel().getClass().getName())) {
-                return true;
-            }
-
-            Channel parent = ctx.channel().parent();
-            if (parent != null && containsGeyserMarker(parent.getClass().getName())) {
-                return true;
-            }
-
-            SocketAddress localAddress = ctx.channel().localAddress();
-            if (localAddress != null && (containsGeyserMarker(localAddress.getClass().getName()) || containsGeyserMarker(localAddress.toString()))) {
-                return true;
-            }
-
-            SocketAddress remoteAddress = ctx.channel().remoteAddress();
-            if (remoteAddress != null && containsGeyserMarker(remoteAddress.getClass().getName())) {
-                return true;
-            }
-
-            for (String name : ctx.pipeline().names()) {
-                if (containsGeyserMarker(name)) {
-                    return true;
-                }
-
-                try {
-                    Object handler = ctx.pipeline().get(name);
-                    if (handler != null && containsGeyserMarker(handler.getClass().getName())) {
-                        return true;
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-
-            return false;
-        }
-
-        private boolean containsGeyserMarker(String value) {
-            if (value == null) {
-                return false;
-            }
-
-            String normalized = value.toLowerCase(Locale.ROOT);
-            return normalized.contains("geyser") || normalized.contains("floodgate");
-        }
-
-        private boolean matchCIDR(String ip, String cidr) {
-            try {
-                String[] parts = cidr.split("/");
-                String network = parts[0];
-                int prefix = Integer.parseInt(parts[1]);
-
-                InetAddress addr = InetAddress.getByName(ip);
-                InetAddress netAddr = InetAddress.getByName(network);
-
-                byte[] addrBytes = addr.getAddress();
-                byte[] netBytes = netAddr.getAddress();
-
-                if (addrBytes.length != netBytes.length) {
-                    return false;
-                }
-
-                int fullBytes = prefix / 8;
-                int remainingBits = prefix % 8;
-
-                for (int i = 0; i < fullBytes; i++) {
-                    if (addrBytes[i] != netBytes[i]) {
-                        return false;
-                    }
-                }
-
-                if (remainingBits > 0) {
-                    int mask = (0xFF << (8 - remainingBits)) & 0xFF;
-                    return (addrBytes[fullBytes] & mask) == (netBytes[fullBytes] & mask);
-                }
-
-                return true;
-            } catch (Exception e) {
-                return false;
-            }
-        }
-
-        private boolean matchesV1Signature(ByteBuf buf, int readerIndex, int readableBytes) {
-            return readableBytes >= 6
-                    && buf.getByte(readerIndex) == 'P'
-                    && buf.getByte(readerIndex + 1) == 'R'
-                    && buf.getByte(readerIndex + 2) == 'O'
-                    && buf.getByte(readerIndex + 3) == 'X'
-                    && buf.getByte(readerIndex + 4) == 'Y'
-                    && buf.getByte(readerIndex + 5) == ' ';
-        }
-
-        private boolean matchesV2Signature(ByteBuf buf, int readerIndex, int readableBytes) {
-            if (readableBytes < 12) {
-                return false;
-            }
-
-            for (int i = 0; i < V2_SIG.length; i++) {
-                if (buf.getByte(readerIndex + i) != V2_SIG[i]) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        private String getSocketIp(SocketAddress remoteAddr) {
-            if (remoteAddr instanceof InetSocketAddress inetSocketAddress) {
-                InetAddress address = inetSocketAddress.getAddress();
-                if (address != null) {
-                    return address.getHostAddress();
-                }
-                return inetSocketAddress.getHostString();
-            }
-            return "unknown";
-        }
-
-        private String extractProxyClientIp(ByteBuf buf) {
-            int readerIndex = buf.readerIndex();
-            int readableBytes = buf.readableBytes();
-
-            if (matchesV1Signature(buf, readerIndex, readableBytes)) {
-                int lineEnd = findLineEnd(buf, readerIndex, readableBytes);
-                int length = lineEnd == -1 ? readableBytes : lineEnd - readerIndex;
-                String header = buf.toString(readerIndex, length, StandardCharsets.US_ASCII).trim();
-                String[] parts = header.split("\\s+");
-                if (parts.length >= 3) {
-                    return parts[2];
-                }
-                return "unknown";
-            }
-
-            if (!matchesV2Signature(buf, readerIndex, readableBytes) || readableBytes < 16) {
-                return "unknown";
-            }
-
-            try {
-                int versionCommand = buf.getUnsignedByte(readerIndex + 12);
-                if ((versionCommand >> 4) != 0x2) {
-                    return "unknown";
-                }
-
-                int familyProtocol = buf.getUnsignedByte(readerIndex + 13);
-                int headerLength = buf.getUnsignedShort(readerIndex + 14);
-                if (readableBytes < 16 + headerLength) {
-                    return "unknown";
-                }
-
-                int family = familyProtocol & 0xF0;
-                if (family == 0x10) {
-                    if (headerLength < 12) {
-                        return "unknown";
-                    }
-                    byte[] source = new byte[4];
-                    buf.getBytes(readerIndex + 16, source);
-                    return InetAddress.getByAddress(source).getHostAddress();
-                }
-
-                if (family == 0x20) {
-                    if (headerLength < 36) {
-                        return "unknown";
-                    }
-                    byte[] source = new byte[16];
-                    buf.getBytes(readerIndex + 16, source);
-                    return InetAddress.getByAddress(source).getHostAddress();
-                }
-            } catch (Exception ignored) {
-                return "unknown";
-            }
-
-            return "unknown";
-        }
-
-        private int findLineEnd(ByteBuf buf, int readerIndex, int readableBytes) {
-            int maxIndex = readerIndex + readableBytes - 1;
-            for (int i = readerIndex; i < maxIndex; i++) {
-                if (buf.getByte(i) == '\r' && buf.getByte(i + 1) == '\n') {
-                    return i;
-                }
-            }
-            return -1;
-        }
+    private record PluginConfig(String language, boolean whitelistEnabled, List<String> whitelist) {
     }
 }
